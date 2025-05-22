@@ -1,0 +1,16 @@
+# config.yml
+alpaca:
+  API_KEY: "PKQPXKCSP3FXIZG65FVZ"
+  API_SECRET: "UVEDR5uXs1eSDdRLrhe8TCpZOCkbtLrYnCtmZ6dh"
+  BASE_URL: "https://paper-api.alpaca.markets/v2"
+  PAPER: true
+
+Backtest: true
+DataProvider: YahooDataBacktesting
+StartDate: 2019-10-01
+EndDate: 2024-12-31
+Symbols:
+  - SPY
+  - AAPL
+  - MSFT
+InitialCash: 100000
