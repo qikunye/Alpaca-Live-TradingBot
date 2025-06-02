@@ -1,5 +1,6 @@
 from lumibot.brokers import Alpaca
 from lumibot.backtesting import YahooDataBacktesting
+from lumibot.data_sources import YahooData
 from lumibot.strategies.strategy import Strategy
 from lumibot.traders import Trader
 from datetime import datetime 
@@ -7,7 +8,7 @@ from alpaca_trade_api import REST
 from pandas import Timedelta
 from csv_backtesting import CSVDataBacktesting
 from finbert_utils import estimate_sentiment
-from tensorflow.keras.models import load_model
+from transformers import TimeSeriesTransformerConfig
 import joblib
 import numpy as np  
 from numpy.random import beta
@@ -15,6 +16,12 @@ import xgboost as xgb
 import pandas as pd
 import yaml
 from alpaca_trade_api import REST
+import yfinance as yf
+import requests
+from transformers import TimeSeriesTransformerForPrediction
+import torch
+import os
+from pathlib import Path
 
 class Asset:
     def __init__(self, symbol):
@@ -32,7 +39,7 @@ class Asset:
 
 
 
-with open("config.yml", "r") as file:
+with open("/Users/qikunye/Documents/Machine Learning Udemy/tradingbot/config.yml", "r") as file:
     config = yaml.safe_load(file)
 
 API_KEY = config["alpaca"]["API_KEY"]
@@ -44,82 +51,186 @@ ALPACA_CREDS = {
     "API_SECRET": API_SECRET,
     "PAPER": True
 }
-api = REST(key_id=API_KEY, secret_key=API_SECRET, base_url=BASE_URL)
+# this is for live data from alpaca
+# api = REST(key_id=API_KEY, secret_key=API_SECRET, base_url=BASE_URL)
+
+
+NEWSAPI_KEY = "ec92ed3d709141bab0eee6bd36e4070a"  # replace with your actual key
+
+
+from transformers import TimeSeriesTransformerForPrediction
+
+model = TimeSeriesTransformerForPrediction.from_pretrained("./transformer_price_model")
 
 
 
 
+
+news_cache = {}
 
 class MLTrader(Strategy): 
-    def initialize(self, symbols=["SPY", "AAPL", "MSFT"], cash_at_risk:float=0.5): 
+    def initialize(self, symbols=["SPY", "AAPL"], cash_at_risk:float=0.5): 
         self.symbols = symbols
         self.sleeptime = "24H" 
         self.last_trade = {}
         self.cash_at_risk = cash_at_risk
         self.api = REST(base_url=BASE_URL, key_id=API_KEY, secret_key=API_SECRET)
-
-    #LSTM_price prediction
-        self.model = load_model("lstm_price_predictor.keras")
-        self.scaler = joblib.load("lstm_scaler.pkl")
         self.lookback = 30
+        
+        
+        model_path = Path("tradingbot/transformer_price_model")
+        self.transformer_model = TimeSeriesTransformerForPrediction.from_pretrained(str(model_path))
+        print("Loading model from:", str(model_path))
 
-     # Thompson Sampling setup
+
+        self.transformer_config = self.transformer_model.config
+        scaler_path = os.path.join(os.path.dirname(__file__), "transformer_scaler.pkl")
+        self.scaler = joblib.load(scaler_path)
+
+
+
+
+
+   
+
+
+    #Thompson Sampling setup
         self.symbol_index = {symbol: i for i, symbol in enumerate(self.symbols)}
         self.wins = [1] * len(self.symbols)
         self.losses = [1] * len(self.symbols)
         self.trade_outcomes = {}  # to store outcome tracking
     #xgboost
         self.xgb_model = xgb.XGBRegressor()
-        self.xgb_model.load_model("xgb_bollinger_model.json")
-        self.xgb_features = joblib.load("xgb_features.pkl")
+        self.xgb_model.load_model("tradingbot/xgb_bollinger_model.json")
+        self.xgb_features = joblib.load("tradingbot/xgb_features.pkl")
 
-    def position_sizing(self,symbol): 
-        cash = self.get_cash() 
-        last_price = self.get_last_price(symbol)
+    def position_sizing(self, symbol): 
+        last_price = self.get_last_price(str(symbol))
         if last_price is None:
             self.log_message(f"⚠️ Warning: No last price available for {symbol}")
-            return 0, None, 0  # Return something safe to avoid crashing
-        quantity = round(cash * self.cash_at_risk / last_price,0)
-        return cash, last_price, quantity
+            return 0, None, 0
+
+        position = self.get_position(symbol)
+        position_value = 0
+        if position is not None:
+            position_value = position.quantity * last_price
+
+        available_cash = self.get_cash() 
+        if available_cash <= 0:
+            return 0, last_price, 0
+
+        quantity = round(available_cash * self.cash_at_risk / last_price, 0)
+        if quantity < 1:  # Add validation
+            return 0, last_price, 0
+        return available_cash, last_price, quantity
+
 
     def get_dates(self): 
         today = self.get_datetime()
         three_days_prior = today - Timedelta(days=3)
         return today.strftime('%Y-%m-%d'), three_days_prior.strftime('%Y-%m-%d')
-
-    def get_sentiment(self, symbol): 
+    
+    def get_sentiment(self, symbol):
         try:
-            today, three_days_prior = self.get_dates()
-            news = self.api.get_news(symbol=symbol, start=three_days_prior, end=today) 
-            news = [ev.__dict__["_raw"]["headline"] for ev in news]
-            probability, sentiment = estimate_sentiment(news)
-            return probability, sentiment 
+            today = pd.Timestamp.now().normalize() - pd.Timedelta(days=1)
+
+            three_days_prior = today - pd.Timedelta(days=3)
+
+            # Enforce 30-day limit on start date
+            earliest_allowed = today - pd.Timedelta(days=30)
+            start_date = max(three_days_prior, earliest_allowed)
+
+            cache_key = f"{symbol}_{today.strftime('%Y-%m-%d')}"
+            if cache_key in news_cache:
+                headlines = news_cache[cache_key]
+            else:
+                # Prepare NewsAPI request
+                url = "https://newsapi.org/v2/everything"
+                params = {
+                    "q": str(symbol),
+                    "from": start_date.strftime('%Y-%m-%d'),
+                    "to": today.strftime('%Y-%m-%d'),
+                    "language": "en",
+                    "sortBy": "relevancy",
+                    "pageSize": 20,  # max results to fetch
+                    "apiKey": NEWSAPI_KEY
+                }
+                response = requests.get(url, params=params)
+                response.raise_for_status()
+                articles = response.json().get("articles", [])
+                headlines = [article["title"] for article in articles]
+                news_cache[cache_key] = headlines
+                if not headlines:
+                    print(f"[{symbol}] No headlines found. Returning neutral sentiment.")
+                    return 0.5, "neutral"
+
+
+            #Optional: keyword filtering to reduce noise
+            keywords = [symbol.lower(), "stock", "price", "earnings", "revenue", "ceo", "lawsuit", 
+            "investigation", "buy", "sell", "downgrade", "upgrade", "target", "forecast", "regulation"]
+
+            filtered_headlines = [h for h in headlines if any(kw in h.lower() for kw in keywords)]
+            if not filtered_headlines and headlines:
+                filtered_headlines = headlines[:5]
+
+            probability, sentiment = estimate_sentiment(filtered_headlines)
+            if probability > 0.55:
+                sentiment = "positive"
+            elif probability < 0.45:
+                sentiment = "negative"
+            else:
+                sentiment = "neutral"
+            #logging sentiment for debugging
+            print(f"[{symbol}] Headlines used for sentiment analysis:")
+            for headline in headlines:
+                print(f" - {headline}")
+            print(f"[{symbol}] Sentiment result: {sentiment}, Probability: {probability:.3f}")
+            return probability, sentiment
+
         except Exception as e:
             print(f"[{symbol}] Sentiment fetch error: {e}")
             return 0.5, "neutral"
 
     
+ 
+
     def get_historical_data(self, symbol, limit=60):
         try:
-            # In backtesting, use built-in get_historical_data
-            if not self.broker.paper_trading:
-                # Backtesting
-                bars = self.get_historical_prices(symbol, bar_size="1d", length=limit)
-                if bars.empty:
-                    print(f"[{symbol}] Warning: No bars returned from Alpaca API.")
+            is_backtesting = isinstance(self.broker, YahooDataBacktesting)
+
+            if is_backtesting:
+                bars = self.get_historical_prices(symbol, timeframe="1d", length=limit, feed='iex')
+                if len(bars) < self.lookback:
+                    print(f"[{symbol}] Insufficient data: {len(bars)} < {self.lookback}")
+                    return None
+                if bars is None or bars.empty:
+                    print(f"[{symbol}] Warning: No bars returned in backtest mode.")
                     return None
             else:
-                bars = self.api.get_bars(symbol, timeframe='1Day', limit=limit, feed='iex').df
-                if bars.empty:
-                    print(f"[{symbol}] Warning: No bars returned from backtest broker.")
+                # Yahoo Finance live fetch replacement
+                data = yf.download(str(symbol), period=f"{limit}d", interval="1d")
+                if data is None or data.empty:
+                    print(f"[{symbol}] Warning: No bars returned from Yahoo Finance.")
                     return None
-
+                data.index = pd.to_datetime(data.index)
+                bars = data.rename(columns={
+                    "Open": "open", 
+                    "High": "high", 
+                    "Low": "low", 
+                    "Close": "close", 
+                    "Volume": "volume"
+                })
+                bars = bars[['open', 'high', 'low', 'close', 'volume']]  # keep expected cols
+            
             bars.index = pd.to_datetime(bars.index)
             bars = bars.tz_localize(None)
             return bars
+
         except Exception as e:
             print(f"[{symbol}] Error fetching bars: {e}")
             return None
+
+
 
 
     
@@ -146,33 +257,39 @@ class MLTrader(Strategy):
         else:
             self.losses[i] += 1
 
-    def get_lstm_prediction(self, bars):
-        df = pd.DataFrame(bars)
-        if not all(col in df.columns for col in ['open', 'high', 'low', 'close', 'volume']):
-            raise ValueError(f"LSTM input missing required columns. Got: {df.columns.tolist()}")
-
-        df = df[['open', 'high', 'low', 'close', 'volume']].tail(self.lookback)
+     #transformer 
+    def get_transformer_prediction(self, bars):
+        df = bars[['open', 'high', 'low', 'close', 'volume']].tail(self.lookback)
         if len(df) < self.lookback:
             return None
 
-        scaled = self.scaler.transform(df)
-        X_input = np.expand_dims(scaled, axis=0)
-        predicted_scaled = self.model.predict(X_input)[0][0]
+        scaled = self.transformer_scaler.transform(df)
+        input_tensor = torch.tensor([scaled], dtype=torch.float32)  # shape (1, 30, 5)
 
-        reconstructed = np.zeros((1, 5))
-        reconstructed[0, 3] = predicted_scaled  # Only filling the 'close' column
-        pred_price = self.scaler.inverse_transform(reconstructed)[0][3]
-        return pred_price
+        with torch.no_grad():
+            output = self.transformer_model(past_values=input_tensor).logits
+        pred_scaled = output[0].item()
 
+        last_row = scaled[-1]
+        last_row[3] = pred_scaled
+        full_reconstructed = np.array([last_row])
+        pred_price = self.transformer_scaler.inverse_transform(full_reconstructed)[0][3]
+        return float(pred_price)
+
+   
     
     def get_xgb_prediction(self, bars):
         df = pd.DataFrame(bars)
-        print("XGB - DataFrame Columns:", df.columns)
 
+        # Flatten multi-index columns
+        df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+        print(f"Input df columns: {df.columns.tolist()}, shape: {df.shape}")
+
+        # Check required columns
         if not all(col in df.columns for col in ['close', 'volume']):
             raise ValueError(f"Missing required columns for XGB features. Got: {df.columns.tolist()}")
 
-        # Feature engineering (must match training logic)
+        # Feature engineering
         df['sma_20'] = df['close'].rolling(window=20).mean()
         df['std_20'] = df['close'].rolling(window=20).std()
         df['upper_band'] = df['sma_20'] + 2 * df['std_20']
@@ -182,14 +299,25 @@ class MLTrader(Strategy):
         df['close_to_upper'] = (df['close'] - df['upper_band']) / df['upper_band']
         df['close_to_lower'] = (df['close'] - df['lower_band']) / df['lower_band']
         df['vol_to_avgvol'] = df['volume'] / df['avg_vol_15']
+
+        print(f"Shape before dropna: {df.shape}")
         df.dropna(inplace=True)
+        print(f"Shape after dropna: {df.shape}")
 
         if df.empty:
+            print("DataFrame is empty after dropna, no prediction made.")
             return None
 
-        latest_features = df[self.xgb_features].iloc[-1]
-        prediction = self.xgb_model.predict([latest_features])[0]
-        return prediction  # Next-day return
+        try:
+            latest_features = df[self.xgb_features].iloc[-1]
+            prediction = self.xgb_model.predict(latest_features.values.reshape(1, -1))[0]
+            print(f"Prediction: {prediction}")
+            return prediction
+        except Exception as e:
+            print(f"Error during prediction: {e}")
+            return None
+
+
 
 
 
@@ -197,12 +325,27 @@ class MLTrader(Strategy):
 
     def on_trading_iteration(self):
         ranked_symbols = self.choose_asset_thompson()
+        now = self.get_datetime()
         
         for symbol in ranked_symbols:
             cash, last_price, quantity = self.position_sizing(symbol)
             if last_price is None or quantity == 0:
                 continue 
-            probability, sentiment = self.get_sentiment(symbol)
+
+            # Skip if already in a position
+            position = self.get_position(symbol)
+            if position is not None and position.quantity > 0:
+                print(f"[{symbol}] Already in position. Skipping.")
+                continue
+
+            # Cooldown check
+            last_trade_time = self.last_trade.get(f"{symbol}_time", now - Timedelta(days=10))
+            if (now - last_trade_time).days < 5:
+                print(f"[{symbol}] In cooldown period. Skipping.")
+                continue
+
+            probability, sentiment = self.get_sentiment(str(symbol))
+            sentiment_factor = (probability - 0.5) * 2  # from -1 to 1
 
             # Fetch recent bars
             bars = self.get_historical_data(symbol, limit=60)
@@ -217,93 +360,198 @@ class MLTrader(Strategy):
                 continue
 
             # Predict price using LSTM
-            predicted_price = self.get_lstm_prediction(bars)
+            predicted_price = self.get_transformer_prediction(bars)
             if predicted_price is None:
                 print(f"[{symbol}] Skipping - LSTM prediction failed")
                 continue
 
             print(f"[{symbol}] Sentiment: {sentiment}, Prob: {probability:.3f}, XGB: {xgb_return:.4f}, LSTM: {predicted_price:.2f}, Last: {last_price:.2f}")
 
-          
+            transformer_price = self.get_transformer_prediction(bars)
 
             # Initialize trade history if not already
             if symbol not in self.last_trade:
                 self.last_trade[symbol] = None
+            
+            # Calculate LSTM and XGB signal strengths
+            transformer_score = (transformer_price - last_price) / last_price
+            xgb_strength = abs(xgb_return)
+
+           
+            # 4️⃣ Normalize weights
+            total = transformer_score + xgb_strength
+            if total > 0:
+                transformer_weight = transformer_score / total
+                xgb_weight = xgb_strength / total
+            else:
+                transformer_weight = xgb_weight = 0.5
+
+            
+
+
+            # 5️⃣ Calculate final score
+            combined_score = transformer_weight * ((predicted_price - last_price) / last_price) + \
+                            xgb_weight * xgb_return
+            
+            adjusted_score = combined_score * (1 + 0.1 * sentiment_factor)
+
+            print(f"[{symbol}] LSTM Weight: {transformer_weight:.2f}, XGB Weight: {xgb_weight:.2f}, Combined Score: {combined_score:.4f}")
+
+
 
             # Entry logic
             if cash > last_price:
-                # LONG trade condition
-                if (sentiment == "positive" and probability > 0.6 and 
-                    xgb_return > 0.001 and predicted_price > last_price * 1.001):
-                    
-                    if self.last_trade[symbol] == "sell":
-                        self.sell_all()
 
-                    order = self.create_order(
-                        symbol,
-                        quantity,
-                        "buy",
-                        type="bracket",
-                        take_profit_price=last_price * 1.20,
-                        stop_loss_price=last_price * 0.95
+                #debug manual overide
+                debug_override = False  # set False to disable manual sentiment override
+                if debug_override and symbol == "AAPL":
+                    sentiment = "negative"
+                    print(f"[OVERRIDE] Forced sentiment for {symbol} to 'negative' for testing.")
+
+
+                action = None
+            
+           # Define returns first
+            returns = bars["close"].pct_change().dropna()
+
+            # Calculate volatility from returns
+            volatility_factor = 1.5 if probability > 0.7 else 2.5
+            volatility = returns.rolling(window=10).std().iloc[-1]
+            if isinstance(volatility, pd.Series):
+                volatility = volatility.item()  # flatten to scalar if needed
+            volatility = min(float(volatility), 0.03)  # ✅ this is safe
+
+            threshold = max(0.001, 0.3 * volatility)
+            if adjusted_score > threshold:
+                action = "buy"
+            elif adjusted_score < -threshold:
+                action = "sell"
+
+            if action == "buy":
+                returns = bars["close"].pct_change().dropna()
+
+                volatility_factor = 1.5 if probability > 0.7 else 2.5
+                volatility = returns.rolling(window=10).std().iloc[-1]
+                if isinstance(volatility, pd.Series):
+                    volatility = volatility.item()  # flatten to scalar if needed
+                volatility = min(float(volatility), 0.03)  # ✅ this is safe
+
+                tp = last_price * (1 + volatility_factor * volatility)
+                sl = last_price * (1 - volatility_factor * volatility)
+
+                order = self.create_order(
+                    str(symbol),
+                    quantity,
+                    "buy",
+                    type="bracket",
+                    take_profit_price=tp,
+                    stop_loss_price=sl
+                )
+                self.submit_order(order)
+        
+                self.last_trade[f"{symbol}_time"] = now
+                self.trade_outcomes[symbol] = order
+
+            elif action == "sell" and position is not None and position.quantity > 0:
+                returns = bars["close"].pct_change().dropna()
+                volatility_factor = 1.5 if probability > 0.7 else 2.5
+                volatility = returns.rolling(window=10).std().iloc[-1]
+                if isinstance(volatility, pd.Series):
+                    volatility = volatility.item()  # flatten to scalar if needed
+                volatility = min(float(volatility), 0.03)  # ✅ this is safe
+
+                tp = last_price * (1 + volatility_factor * volatility)
+                sl = last_price * (1 - volatility_factor * volatility)
+
+                order = self.create_order(
+                    str(symbol),
+                    quantity,
+                    "sell",
+                    type="bracket",
+                    take_profit_price=tp,
+                    stop_loss_price=sl
+                )
+                self.submit_order(order)
+          
+                self.last_trade[f"{symbol}_time"] = now
+                self.trade_outcomes[symbol] = order
+
+            else:
+                print(f"[{symbol}] Skipped - combined_score not significant.")
+                print(f"[DEBUG] Sentiment: {sentiment}, Prob: {probability:.3f}, Score: {combined_score:.4f}")
+
+
+        # ✅ Evaluate active positions for early exit if sentiment/model reverses
+        for symbol in self.symbols:
+            position = self.get_position(symbol)
+            if position is not None and position.quantity > 0:
+                bars = self.get_historical_data(symbol)
+                if bars is None or len(bars) < 50:
+                    continue
+
+                predicted_price = self.get_transformer_prediction(bars)
+                if predicted_price is None:
+                    continue
+
+                current_price = bars["close"].iloc[-1]
+                if isinstance(current_price, pd.Series):
+                    current_price = current_price.item() 
+                change = float((predicted_price - current_price) / current_price)
+
+                if change < -0.03 and sentiment == "negative":  # Predicting >=3% drop
+                    print(f"[{symbol}] 🚨 LSTM predicts drop. Exiting early.")
+                    self.submit_order(
+                        self.create_order(symbol, position.quantity, "sell", type="market")
                     )
-                    self.submit_order(order)
-                    self.last_trade[symbol] = "buy"
-                    self.trade_outcomes[symbol] = order
+                    self.last_trade[f"{symbol}_time"] = self.get_datetime()
 
-                # SHORT trade condition
-                elif (sentiment == "negative" and probability > 0.6 and 
-                    xgb_return < -0.001 and predicted_price < last_price * 0.999):
+        # ✅ Print final portfolio value AFTER all symbols processed
+        portfolio_value = self.get_portfolio_value()
+        if not hasattr(self, 'initial_cash'):
+            self.initial_cash = portfolio_value
 
-                    if self.last_trade[symbol] == "buy":
-                        self.sell_all()
+        drawdown = (portfolio_value - self.initial_cash) / self.initial_cash
+        if drawdown < -0.30:
+            self.log_message("❌ Max drawdown exceeded. Stopping trading.")
+            self.stop_trading()
+            return
 
-                    order = self.create_order(
-                        symbol,
-                        quantity,
-                        "sell",
-                        type="bracket",
-                        take_profit_price=last_price * 0.80,
-                        stop_loss_price=last_price * 1.05
-                    )
-                    self.submit_order(order)
-                    self.last_trade[symbol] = "sell"
-                    self.trade_outcomes[symbol] = order
+        print(f"✅ Final portfolio value: {portfolio_value:.2f}")
+        
 
-symbols = [Asset("SPY"), Asset("AAPL"), Asset("MSFT")]
+   
+
+       
+
+symbols = [Asset("SPY"), Asset("AAPL")]
 
 start_date = pd.Timestamp("2019-10-01").tz_localize(None)
 end_date = pd.Timestamp("2024-12-31").tz_localize(None)
 
 
+data_source = YahooDataBacktesting(
+    datetime_start=start_date,
+    datetime_end=end_date
+)
 
-broker = Alpaca(ALPACA_CREDS)
+broker = Alpaca(ALPACA_CREDS, data_source=data_source)
+
 strategy = MLTrader(
     name='mlstrat',
     broker=broker,
     parameters={"symbols": symbols, "cash_at_risk": 0.5}
 )
 
-
-# ✅ Pass it into the backtest
-
-
-
 strategy.backtest(
-    # 🔸 Pass the class itself (not an instance)
-    datasource_class=CSVDataBacktesting,
-
-    # 🔸 Pass init arguments using datasource_kwargs
-    datasource_kwargs={
-    "symbols": [Asset("SPY"), Asset("AAPL"), Asset("MSFT")],
-    "datetime_start": datetime(2019, 10, 1),
-    "datetime_end": datetime(2024, 12, 31),
-    },
-
-    # Other strategy parameters...
-    use_cache=False,
-    show_progress=True,
+    YahooDataBacktesting,
+    start_date,
+    end_date
 )
+
+
+
+
+
 
 
 
