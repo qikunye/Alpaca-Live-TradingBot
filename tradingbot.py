@@ -55,7 +55,7 @@ ALPACA_CREDS = {
 # api = REST(key_id=API_KEY, secret_key=API_SECRET, base_url=BASE_URL)
 
 
-NEWSAPI_KEY = "ec92ed3d709141bab0eee6bd36e4070a"  # replace with your actual key
+NEWSAPI_KEY = NEWS_API_KEY 
 
 
 from transformers import TimeSeriesTransformerForPrediction
