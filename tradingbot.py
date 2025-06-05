@@ -37,9 +37,9 @@ class Asset:
     def __hash__(self):
         return hash(self.symbol)
 
+config_path = os.path.join(os.path.dirname(__file__), 'config.yml')
 
-
-with open("/Users/qikunye/Documents/Machine Learning Udemy/tradingbot/config.yml", "r") as file:
+with open(config_path, "r") as file:
     config = yaml.safe_load(file)
 
 API_KEY = config["alpaca"]["API_KEY"]
