@@ -10,6 +10,8 @@ from transformers import (
 )
 from sklearn.preprocessing import MinMaxScaler
 import joblib
+import shutil
+
 
 # 1. Load and preprocess data
 print("DEBUG: Loading CSV data...")
@@ -48,55 +50,96 @@ scaled_data = np.hstack([scaled_prices_vol, df[time_features].values])
 print(f"DEBUG: Combined scaled data shape (prices+time features): {scaled_data.shape}")
 
 # 3. Dataset Definition
-lookback = 60
+lookback = 64
 horizon = 1
 
+
 class TimeSeriesDataset(Dataset):
-    def __init__(self, data, lookback, horizon, static_categorical, static_real):
+    def __init__(self, data, config, static_categorical, static_real):
+        self.config = config
+        self.lookback = config.context_length
+        self.lags = config.lags_sequence
+        self.required_history = self.lookback + max(self.lags)
+
         print(f"DEBUG: Initializing TimeSeriesDataset with data length: {len(data)}")
-        self.X, self.y = [], []
+        print(f"DEBUG: Required sequence length per sample: {self.required_history}")
+
+        self.X = []
+        self.y = []
         self.static_categorical = static_categorical
         self.static_real = static_real
-        for i in range(len(data) - lookback - horizon + 1):
-            seq = data[i:i + lookback]
-            if i < 3 or i > len(data) - lookback - horizon - 3:
-                print(f"DEBUG: Sample {i} length: {len(seq)}")  # print only first and last few samples to reduce clutter
-            self.X.append(seq)
-            self.y.append(data[i + lookback: i + lookback + horizon])
-        self.X = torch.tensor(np.array(self.X), dtype=torch.float32)
-        self.y = torch.tensor(np.array(self.y), dtype=torch.float32)
-        print(f"DEBUG: Dataset tensors created: X shape {self.X.shape}, y shape {self.y.shape}")
+
+        for i in range(self.required_history, len(data) - config.prediction_length + 1):
+            seq = data[i - self.required_history:i]
+            target = data[i:i + config.prediction_length]
+
+            self.X.append(torch.tensor(seq, dtype=torch.float32))
+            self.y.append(torch.tensor(target, dtype=torch.float32))
+
+        print(f"DEBUG: Dataset tensors created: X shape {[x.shape for x in self.X[:1]]}, total samples: {len(self.X)}")
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
+        past = self.X[idx]  # Shape: [required_history, features]
+        future = self.y[idx]  # Shape: [horizon, features]
+
+        # Safety check
+        if past.shape[0] < self.required_history:
+            raise ValueError(f"past_values too short: {past.shape[0]} < required {self.required_history}")
+
         sample = {
-            "past_values": self.X[idx],
-            "past_time_features": self.X[idx][:, -len(time_features):],  # last N columns for time features
-            "past_observed_mask": torch.ones((lookback, 1), dtype=torch.bool),
-            "future_values": self.y[idx],
-            "future_time_features": self.y[idx][:, -len(time_features):],
-            "future_observed_mask": torch.ones((horizon, 1), dtype=torch.bool),
+            "past_values": past,  # Full [context + max_lag] used by model
+            "past_time_features": past[:, -self.config.num_time_features:],
+            "past_observed_mask": torch.ones((past.shape[0], 1), dtype=torch.bool),
+            "future_values": future,
+            "future_time_features": future[:, -self.config.num_time_features:],
+            "future_observed_mask": torch.ones((future.shape[0], 1), dtype=torch.bool),
             "static_categorical_features": self.static_categorical.clone().unsqueeze(0),
             "static_real_features": self.static_real.clone().unsqueeze(0),
-            "labels": self.y[idx]
+            "labels": future.reshape(self.config.prediction_length, -1),
         }
-        if idx < 3:
+
+        if idx < 2:
             print(f"DEBUG: __getitem__ sample {idx} keys and shapes:")
             for k, v in sample.items():
-                print(f"  {k}: shape {v.shape if isinstance(v, torch.Tensor) else type(v)}")
+                print(f"  {k}: {v.shape if isinstance(v, torch.Tensor) else type(v)}")
+
         return sample
+
 
 # 4. Prepare static features
 static_categorical = torch.tensor([0, 1], dtype=torch.long)
 static_real = torch.tensor([0.09, 1993.0], dtype=torch.float32)
 
+
+# 7. Model Configuration
+config = TimeSeriesTransformerConfig(
+    prediction_length=horizon,
+    context_length=60,
+    input_size=len(feature_cols) + len(time_features),
+    num_time_features=len(time_features),
+    num_static_categorical_features=static_categorical.shape[0],
+    num_static_real_features=static_real.shape[0],
+    cardinality=[2, 2],
+    embedding_dimension=[2, 2],
+    use_static_features=True,
+    lags_sequence=[1,2,3]
+)
+
+print(f"DEBUG: Model config - input_size: {config.input_size}, context_length: {config.context_length}")
+
+model = TimeSeriesTransformerForPrediction(config)
+
+
 dataset = TimeSeriesDataset(
-    scaled_data, lookback, horizon,
+    data=scaled_data,
+    config=config,
     static_categorical=static_categorical,
     static_real=static_real
 )
+
 
 # 5. Train/Validation Split
 train_size = int(0.8 * len(dataset))
@@ -117,23 +160,15 @@ def custom_collate(batch):
 
 data_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=custom_collate)
 
-# 7. Model Configuration
-config = TimeSeriesTransformerConfig(
-    prediction_length=horizon,
-    context_length=lookback,
-    input_size=len(feature_cols) + len(time_features),
-    num_time_features=len(time_features),
-    num_static_categorical_features=static_categorical.shape[0],
-    num_static_real_features=static_real.shape[0],
-    cardinality=[2, 2],
-    embedding_dimension=[2, 2],
-    use_static_features=True,
-    lags_sequence=[1, 2, 3, 4]
-)
 
-print(f"DEBUG: Model config - input_size: {config.input_size}, context_length: {config.context_length}")
 
-model = TimeSeriesTransformerForPrediction(config)
+
+
+# Remove checkpoint config to avoid stale config loading
+
+shutil.rmtree("./transformer_checkpoints", ignore_errors=True)
+shutil.rmtree("./logs", ignore_errors=True)
+
 
 # 8. Trainer setup
 training_args = TrainingArguments(
@@ -145,9 +180,9 @@ training_args = TrainingArguments(
     save_strategy="epoch",
     logging_dir="./logs",
     logging_steps=20,
-    save_total_limit=2,
+    save_total_limit=1,
     load_best_model_at_end=True,
-    metric_for_best_model="loss",
+    metric_for_best_model="eval_runtime",
     greater_is_better=False
 )
 
@@ -159,7 +194,8 @@ trainer = Trainer(
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
     data_collator=custom_collate,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
+    
 )
 
 print("DEBUG: Starting training...")
@@ -170,6 +206,6 @@ print("DEBUG: Training complete.")
 model.save_pretrained("transformer_price_model")
 print("DEBUG: Model saved to 'transformer_price_model'.")
 
-print("Sample X shape:", dataset.X.shape)
+print("Sample X shape:", dataset.X[0].shape)
 print("Config context length:", config.context_length)
 print("Max lag:", max(config.lags_sequence))
