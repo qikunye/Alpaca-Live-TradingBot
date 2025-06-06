@@ -23,6 +23,7 @@ import torch
 import os
 from pathlib import Path
 
+
 class Asset:
     def __init__(self, symbol):
         self.symbol = symbol
@@ -55,12 +56,8 @@ ALPACA_CREDS = {
 # api = REST(key_id=API_KEY, secret_key=API_SECRET, base_url=BASE_URL)
 
 
-NEWSAPI_KEY = NEWS_API_KEY 
+NEWSAPI_KEY =  "ec92ed3d709141bab0eee6bd36e4070a" 
 
-
-from transformers import TimeSeriesTransformerForPrediction
-
-model = TimeSeriesTransformerForPrediction.from_pretrained("./transformer_price_model")
 
 
 
@@ -75,17 +72,21 @@ class MLTrader(Strategy):
         self.last_trade = {}
         self.cash_at_risk = cash_at_risk
         self.api = REST(base_url=BASE_URL, key_id=API_KEY, secret_key=API_SECRET)
-        self.lookback = 30
+        self.lookback = 120
         
         
-        model_path = Path("tradingbot/transformer_price_model")
-        self.transformer_model = TimeSeriesTransformerForPrediction.from_pretrained(str(model_path))
-        print("Loading model from:", str(model_path))
+        model_path = "./transformer_price_model"
+        self.transformer_model = TimeSeriesTransformerForPrediction.from_pretrained(model_path)
+        
+        print("Loaded Hugging Face Transformer model.")
 
 
         self.transformer_config = self.transformer_model.config
         scaler_path = os.path.join(os.path.dirname(__file__), "transformer_scaler.pkl")
         self.scaler = joblib.load(scaler_path)
+
+        self.required_history_length = (self.transformer_model.config.context_length + max(self.transformer_model.config.lags_sequence))
+
 
 
 
@@ -101,8 +102,8 @@ class MLTrader(Strategy):
         self.trade_outcomes = {}  # to store outcome tracking
     #xgboost
         self.xgb_model = xgb.XGBRegressor()
-        self.xgb_model.load_model("tradingbot/xgb_bollinger_model.json")
-        self.xgb_features = joblib.load("tradingbot/xgb_features.pkl")
+        self.xgb_model.load_model("./xgb_bollinger_model.json")
+        self.xgb_features = joblib.load("./xgb_features.pkl")
 
     def position_sizing(self, symbol): 
         last_price = self.get_last_price(str(symbol))
@@ -147,7 +148,7 @@ class MLTrader(Strategy):
                 # Prepare NewsAPI request
                 url = "https://newsapi.org/v2/everything"
                 params = {
-                    "q": str(symbol),
+                    "q": f"{symbol} stock OR ETF OR price",
                     "from": start_date.strftime('%Y-%m-%d'),
                     "to": today.strftime('%Y-%m-%d'),
                     "language": "en",
@@ -194,7 +195,7 @@ class MLTrader(Strategy):
     
  
 
-    def get_historical_data(self, symbol, limit=60):
+    def get_historical_data(self, symbol, limit=120):
         try:
             is_backtesting = isinstance(self.broker, YahooDataBacktesting)
 
@@ -257,24 +258,78 @@ class MLTrader(Strategy):
         else:
             self.losses[i] += 1
 
-     #transformer 
+    #  transformer 
     def get_transformer_prediction(self, bars):
-        df = bars[['open', 'high', 'low', 'close', 'volume']].tail(self.lookback)
-        if len(df) < self.lookback:
+        try:
+            # Match features used during training
+            price_features = ['open', 'high', 'low', 'close', 'volume']
+            time_features = ['day_of_week', 'day_of_month', 'month']
+          
+            df = bars[price_features].copy()
+
+            # Add time-based features
+            df['day_of_week'] = df.index.dayofweek / 6.0
+            df['day_of_month'] = (df.index.day - 1) / 30.0
+            df['month'] = (df.index.month - 1) / 11.0
+
+            required_length = self.transformer_config.context_length + max(self.transformer_config.lags_sequence)
+
+            # Prepare input feature matrix
+            df_features = df[price_features]
+            df_time = df[time_features].values
+
+            # Scale the price/volume features (ensure feature names match)
+            df_prices_only = pd.DataFrame(df[price_features], columns=self.scaler.feature_names_in_)
+            df_scaled = self.scaler.transform(df_prices_only)
+
+
+            # Combine with time features
+            full_input = np.hstack([df_scaled, df[time_features].values])
+
+            #debug
+            print(f"[Transformer DEBUG] Input shape to model: {full_input[-required_length:].shape}")
+            print(f"[Transformer DEBUG] Input shape to model: {past_values.shape}")  # should match config.context_length x config.input_size
+            print(f"Expected input size: {self.transformer_config.input_size}")
+
+
+            # Determine required length dynamically from model config
+            required_length = self.transformer_config.context_length + max(self.transformer_config.lags_sequence)
+
+            if len(full_input) < required_length:
+                print(f"[Transformer] ❌ Not enough data: need {required_length}, got {len(full_input)}")
+                return None
+
+            # Slice the required window
+            input_slice = full_input[-required_length:]
+            time_slice = df_time[-required_length:]
+
+            # Convert to torch tensors
+            past_values = torch.tensor(input_slice, dtype=torch.float32).unsqueeze(0)
+            past_time_features = torch.tensor(time_slice, dtype=torch.float32).unsqueeze(0)
+            past_observed_mask = torch.ones_like(past_values[:, :, 0:1], dtype=torch.float32)
+
+            # Inference
+            with torch.no_grad():
+                output = self.transformer_model(
+                    past_values=past_values,
+                    past_time_features=past_time_features,
+                    past_observed_mask=past_observed_mask
+                )
+
+            # Extract prediction
+            predicted_vector = output.logits[0, 0].numpy()
+            predicted_main_scaled = predicted_vector[:5]  # only OHLCV were scaled
+            predicted_main_unscaled = self.scaler.inverse_transform([predicted_main_scaled])[0]
+
+            predicted_close = predicted_main_unscaled[3]  # index 3 = 'close'
+            print(f"[Transformer] ✅ Predicted close: {predicted_close:.2f}")
+            return float(predicted_close)
+
+        except Exception as e:
+            print(f"[Transformer] ❌ Prediction error: {e}")
             return None
 
-        scaled = self.transformer_scaler.transform(df)
-        input_tensor = torch.tensor([scaled], dtype=torch.float32)  # shape (1, 30, 5)
 
-        with torch.no_grad():
-            output = self.transformer_model(past_values=input_tensor).logits
-        pred_scaled = output[0].item()
-
-        last_row = scaled[-1]
-        last_row[3] = pred_scaled
-        full_reconstructed = np.array([last_row])
-        pred_price = self.transformer_scaler.inverse_transform(full_reconstructed)[0][3]
-        return float(pred_price)
 
    
     
@@ -348,7 +403,7 @@ class MLTrader(Strategy):
             sentiment_factor = (probability - 0.5) * 2  # from -1 to 1
 
             # Fetch recent bars
-            bars = self.get_historical_data(symbol, limit=60)
+            bars = self.get_historical_data(symbol, limit=self.required_history_length + 10)  # buffer of 10 days
             if bars is None or len(bars) < 50:
                 print(f"[{symbol}] Skipping - not enough bars (have {0 if bars is None else len(bars)})")
                 continue
@@ -367,14 +422,14 @@ class MLTrader(Strategy):
 
             print(f"[{symbol}] Sentiment: {sentiment}, Prob: {probability:.3f}, XGB: {xgb_return:.4f}, LSTM: {predicted_price:.2f}, Last: {last_price:.2f}")
 
-            transformer_price = self.get_transformer_prediction(bars)
+            
 
             # Initialize trade history if not already
             if symbol not in self.last_trade:
                 self.last_trade[symbol] = None
             
             # Calculate LSTM and XGB signal strengths
-            transformer_score = (transformer_price - last_price) / last_price
+            transformer_score = (predicted_price- last_price) / last_price
             xgb_strength = abs(xgb_return)
 
            
@@ -419,22 +474,21 @@ class MLTrader(Strategy):
             volatility = returns.rolling(window=10).std().iloc[-1]
             if isinstance(volatility, pd.Series):
                 volatility = volatility.item()  # flatten to scalar if needed
-            volatility = min(float(volatility), 0.03)  # ✅ this is safe
+            volatility = float(volatility)
 
-            threshold = max(0.001, 0.3 * volatility)
+            # ✅ Adjust dynamic threshold based on actual volatility
+            if volatility < 0.005:
+                threshold = 0.0005  # Lower minimum threshold for quiet markets
+            else:
+                threshold = 0.3 * min(volatility, 0.03)  # keep existing logic
+
             if adjusted_score > threshold:
                 action = "buy"
             elif adjusted_score < -threshold:
                 action = "sell"
 
             if action == "buy":
-                returns = bars["close"].pct_change().dropna()
-
-                volatility_factor = 1.5 if probability > 0.7 else 2.5
-                volatility = returns.rolling(window=10).std().iloc[-1]
-                if isinstance(volatility, pd.Series):
-                    volatility = volatility.item()  # flatten to scalar if needed
-                volatility = min(float(volatility), 0.03)  # ✅ this is safe
+            
 
                 tp = last_price * (1 + volatility_factor * volatility)
                 sl = last_price * (1 - volatility_factor * volatility)
@@ -453,12 +507,7 @@ class MLTrader(Strategy):
                 self.trade_outcomes[symbol] = order
 
             elif action == "sell" and position is not None and position.quantity > 0:
-                returns = bars["close"].pct_change().dropna()
-                volatility_factor = 1.5 if probability > 0.7 else 2.5
-                volatility = returns.rolling(window=10).std().iloc[-1]
-                if isinstance(volatility, pd.Series):
-                    volatility = volatility.item()  # flatten to scalar if needed
-                volatility = min(float(volatility), 0.03)  # ✅ this is safe
+                
 
                 tp = last_price * (1 + volatility_factor * volatility)
                 sl = last_price * (1 - volatility_factor * volatility)
@@ -477,8 +526,19 @@ class MLTrader(Strategy):
                 self.trade_outcomes[symbol] = order
 
             else:
-                print(f"[{symbol}] Skipped - combined_score not significant.")
+                print(f"[{symbol}] 🚫 Not placing trade. Reasons:")
+                if xgb_return is None:
+                    print(" - ❌ XGB return is None")
+                if predicted_price is None:
+                    print(" - ❌ Transformer prediction failed")
+                if abs(adjusted_score) < threshold and probability < 0.85:
+                    action = None
+                elif adjusted_score > threshold:
+                    action = "buy"
+                elif adjusted_score < -threshold:
+                    action = "sell"
                 print(f"[DEBUG] Sentiment: {sentiment}, Prob: {probability:.3f}, Score: {combined_score:.4f}")
+
 
 
         # ✅ Evaluate active positions for early exit if sentiment/model reverses
@@ -498,7 +558,7 @@ class MLTrader(Strategy):
                     current_price = current_price.item() 
                 change = float((predicted_price - current_price) / current_price)
 
-                if change < -0.03 and sentiment == "negative":  # Predicting >=3% drop
+                if change < -0.03 and (sentiment == "neutral" or sentiment == "negative"):  # Predicting >=3% drop
                     print(f"[{symbol}] 🚨 LSTM predicts drop. Exiting early.")
                     self.submit_order(
                         self.create_order(symbol, position.quantity, "sell", type="market")
@@ -509,6 +569,8 @@ class MLTrader(Strategy):
         portfolio_value = self.get_portfolio_value()
         if not hasattr(self, 'initial_cash'):
             self.initial_cash = portfolio_value
+
+      
 
         drawdown = (portfolio_value - self.initial_cash) / self.initial_cash
         if drawdown < -0.30:

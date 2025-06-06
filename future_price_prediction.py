@@ -77,6 +77,8 @@ class TimeSeriesDataset(Dataset):
             self.y.append(torch.tensor(target, dtype=torch.float32))
 
         print(f"DEBUG: Dataset tensors created: X shape {[x.shape for x in self.X[:1]]}, total samples: {len(self.X)}")
+        
+     
 
     def __len__(self):
         return len(self.X)
@@ -164,10 +166,6 @@ data_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=
 
 
 
-# Remove checkpoint config to avoid stale config loading
-
-shutil.rmtree("./transformer_checkpoints", ignore_errors=True)
-shutil.rmtree("./logs", ignore_errors=True)
 
 
 # 8. Trainer setup
@@ -209,3 +207,5 @@ print("DEBUG: Model saved to 'transformer_price_model'.")
 print("Sample X shape:", dataset.X[0].shape)
 print("Config context length:", config.context_length)
 print("Max lag:", max(config.lags_sequence))
+
+

@@ -1,7 +1,7 @@
 # config.yml
 alpaca:
-  API_KEY: ALPACA_API_KEY
-  API_SECRET: ALPACA_API_SECRET
+  API_KEY: "PKQPXKCSP3FXIZG65FVZ"
+  API_SECRET: "UVEDR5uXs1eSDdRLrhe8TCpZOCkbtLrYnCtmZ6dh"
   BASE_URL: "https://paper-api.alpaca.markets/v2"
   PAPER: true
 
