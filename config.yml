@@ -1,16 +1,52 @@
 # config.yml
+
 alpaca:
-  API_KEY: API_KEY
-  API_SECRET: API_SECRET
+  API_KEY: "PKQPXKCSP3FXIZG65FVZ"     # or leave blank if using env vars
+  API_SECRET: "UVEDR5uXs1eSDdRLrhe8TCpZOCkbtLrYnCtmZ6dh"   # or leave blank if using env vars
   BASE_URL: "https://paper-api.alpaca.markets/v2"
   PAPER: true
 
+# Backtest/live settings
 Backtest: true
 DataProvider: YahooDataBacktesting
-StartDate: 2019-10-01
-EndDate: 2024-12-31
+StartDate: 2022-01-01
+EndDate: 2023-12-31
+
+# Trading universe
 Symbols:
   - SPY
   - AAPL
   - MSFT
+
+# Capital & risk
 InitialCash: 100000
+ForceTestTradeOnce: true
+CashAtRisk: 0.1          # Fraction of available cash risked per trade
+LookbackBars: 120        # Bars to pull each iteration
+BarSize: 1D
+UseSimpleFallbackFirst: true
+
+# Transformer model settings (optional)
+Transformer:
+  model_dir: transformer_price_model
+  scaler_path: transformer_scaler.pkl
+  context_length: 60
+  lags_sequence:
+    - 1
+    - 2
+    - 3
+
+# XGBoost model settings (optional)
+XGBoost:
+  model_path: xgb_bollinger_model.json
+  features_path: xgb_features.pkl
+
+# Optional LSTM model settings
+LSTM:
+  model_path: ''
+  scaler_path: ''
+
+# Logging & diagnostics
+Logging:
+  Level: INFO
+  ShowSkips: true
