@@ -1,83 +1,126 @@
 
+# 🦙 Alpaca Live SMA+BB Trader (Minimal, Multi-Symbol)
 
-## Multi-symbol Alpaca trading bot with **SMA (20/50)** + **Bollinger Bands (20, 1σ)** signals.  
-Two modes:
+A practical **live/paper trading bot** for Alpaca that uses **SMA(20/50) crossovers** with a **Bollinger Bands (20, 1σ)** breakout fallback.  
+Designed to be **reliable and transparent** for real orders, with a built-in **lightweight backtester** that saves PnL CSV/PNG and reports **Sharpe**.
+
+---
+
+## 🚀 Features
+
+- **Live trading via Alpaca REST**
+- **Signals**: SMA(20/50) crossover → fallback to Bollinger(20, 1σ) breakout
+- **Multi-symbol** (e.g., `SPY`, `AAPL`, `MSFT`)
+- **Simple risk sizing**: cash-at-risk %, split across active signals, per-symbol cap
+- **Safety guards**: no naked shorts by default; optional “close on opposite” behavior
+- **Backtester**: daily loop, equity curve PNG, returns CSV, **Sharpe ratio**
+
+---
+
+## 📊 Example Output
 
 
-- **Live** trading against Alpaca (paper by default).
-- **Backtest** with an equity curve PNG + CSV and **Sharpe ratio**.
 
-## Features
-- Trades multiple symbols (e.g., `SPY`, `AAPL`, `MSFT`).
-- Signals: SMA crossover first, then Bollinger breakout as fallback.
-- Simple, transparent risk sizing:
-  - Deploys `CashAtRisk` fraction of available cash per run.
-  - Splits evenly across all active signals.
-  - Caps per-symbol allocation via `PerSymbolCap`.
-- Live orders via Alpaca REST.
-- Backtesting (daily):
-  - Loads local CSVs if present, otherwise pulls Alpaca Market Data (IEX).
-  - Tracks cash, positions, equity, returns.
-  - Outputs `backtest_equity.csv`, `backtest_equity.png`, and Sharpe ratio.
-- Configurable via env vars and/or `config.yml`.
+\[ AAPL ]
+SMA fast\[20] last=201.8973 prev=202.6453 | slow\[50] last=201.4053 prev=201.9539 | close=196.3700
+BB(period=20, n=1.0) | close=196.3700, mid=201.8973, upper=205.6656, lower=198.1289
+signal=BB breakout ↓
+\[AAPL] → SELL via BB
+\[ MSFT ]
+SMA fast\[20] last=463.1220 prev=462.0200 | slow\[50] last=425.6564 prev=423.7984 | close=474.8800
+BB(period=20, n=1.0) | close=474.8800, mid=463.1220, upper=471.1893, lower=455.0547
+signal=BB breakout ↑
+\[MSFT] → BUY via BB
+\[AAPL] Sell signal but no long position; skipping to avoid naked short.
+\[MSFT] BUY 10 @ \~474.88  (order\_id=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
 
-## Requirements
-- Python 3.10+ (tested with `/usr/local/bin/python3` on macOS).
-- Packages:
-  ```bash
-  pip install requests pandas pyyaml matplotlib
+
+
+---
+
+## ⚙️ How It Works
+
+1. **Data Fetch**
+   - Uses **Alpaca Market Data v2** (IEX by default) for daily bars.
+   - Separate hosts for **trading** and **market data**.
+
+2. **Signal Generation**
+   - **SMA crossover**: fast(20) over slow(50) → **BUY**; under → **SELL**.
+   - If no cross, check **Bollinger(20, 1σ)**: close > upper → **BUY**; close < lower → **SELL**.
+   - Priority: **SMA first, then BB** fallback (can be swapped).
+
+3. **Sizing & Execution**
+   - Cash-at-risk % of **available cash** × split across active signals.
+   - Per-symbol allocation capped by a fraction of available cash.
+   - Integer shares only; gentle pacing between orders.
+
+4. **Backtesting**
+   - Daily loop using local `*_ohlcv.csv` files or Alpaca data.
+   - Tracks **cash, positions, equity**, computes daily returns and **Sharpe**.
+   - Saves `backtest_equity.csv` + **equity curve PNG**.
+
+---
+
+## 📦 Installation
+
+```bash
+# Create a virtual env (recommended)
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
+pip install requests pandas pyyaml matplotlib
 ````
 
-## Files
+---
 
-* `simplified_tradingbot.py` — the bot, signals, backtester, and entrypoints.
-* `config.yml` — optional config (API keys, symbols, risk, backtest dates).
-* Optional CSVs for backtests: `{SYMBOL}_ohlcv.csv` (e.g., `AAPL_ohlcv.csv`).
+## 🖥️ Usage
 
-> The CSV loader supports:
->
-> * Standard Yahoo-style headers.
-> * Two-row header format:
->
->   * Row 0: `Price,Close,High,Low,Open,Volume`
->   * Row 1: first column has `Date`, others `Ticker,...`
->   * Data from row 2.
+### Live Trading (paper by default)
 
-## Credentials & Endpoints
+Places orders; prints signals (no chart):
 
-Set environment variables (recommended):
+```bash
+/usr/local/bin/python3 /path/to/alpaca-live-sma-bb-trader/simplified_tradingbot.py
+```
+
+### Backtest (chart + CSV + Sharpe)
+
+Runs the backtester; writes files next to the script:
+
+```bash
+RUN_BACKTEST=1 /usr/local/bin/python3 /path/to/alpaca-live-sma-bb-trader/simplified_tradingbot.py
+```
+
+Outputs:
+
+* `backtest_equity.csv` (date, equity, ret)
+* `backtest_equity.png` (equity curve; Sharpe in title)
+* Console: **Final Equity** and **Sharpe**
+
+> Headless/IDE sessions:
+> `export MPLBACKEND=Agg` then open the PNG file.
+
+---
+
+## 🔑 Credentials & Endpoints
+
+Export environment variables (preferred):
 
 ```bash
 export APCA_API_KEY_ID="YOUR_KEY_ID"
 export APCA_API_SECRET_KEY="YOUR_SECRET"
-# paper trading host (default)
-export APCA_API_BASE_URL="https://paper-api.alpaca.markets/v2"
-# market data host (separate from trading)
-export APCA_DATA_BASE_URL="https://data.alpaca.markets/v2"
-# free tier usually needs IEX feed
-export APCA_DATA_FEED="iex"
+export APCA_API_BASE_URL="https://paper-api.alpaca.markets/v2"   # trading
+export APCA_DATA_BASE_URL="https://data.alpaca.markets/v2"       # market data
+export APCA_DATA_FEED="iex"                                      # free tier
 ```
 
-Or fill `config.yml`:
+Or use `config.yml` (the code falls back to this if env vars are absent):
 
 ```yaml
 alpaca:
   API_KEY: "YOUR_KEY_ID"
   API_SECRET: "YOUR_SECRET"
-  BASE_URL: "https://paper-api.alpaca.markets/v2"
-  DATA_BASE_URL: "https://data.alpaca.markets/v2"
-```
-
-> The code prefers env vars. If missing, it falls back to `config.yml`.
-
-## Configuration (`config.yml`)
-
-Minimal example:
-
-```yaml
-alpaca:
-  API_KEY: ""     
-  API_SECRET: ""
   BASE_URL: "https://paper-api.alpaca.markets/v2"
   DATA_BASE_URL: "https://data.alpaca.markets/v2"
 
@@ -86,106 +129,85 @@ Symbols:
   - AAPL
   - MSFT
 
-# Live/backtest shared
-CashAtRisk: 0.10          # fraction of available cash per run
-PerSymbolCap: 0.50        # cap per symbol as fraction of available cash
+CashAtRisk: 0.10
+PerSymbolCap: 0.50
 LookbackBars: 200
 
-# Backtest options
 StartDate: "2024-01-01"
-EndDate: null             # to “today”
+EndDate: null
 InitialCash: 100000
 RiskFreeAnnual: 0.00
 CommissionPerShare: 0.00
 BacktestCSV: "backtest_equity.csv"
 Plot: true
 
-# Execution preferences
 AllowShorts: false
 CloseOnOpposite: true
 ```
 
-## Running
+---
 
-### Live trading (paper by default)
+## ⚙️ Optional Settings
 
-Places orders, prints signals, **no chart**:
+**Env Vars** (short descriptions only):
 
-```bash
-/usr/local/bin/python3 /Users/qikunye/Documents/GitHub/tradingbot/simplified_tradingbot.py
+| Var                   | Purpose                 |
+| --------------------- | ----------------------- |
+| `APCA_API_KEY_ID`     | Alpaca key ID           |
+| `APCA_API_SECRET_KEY` | Alpaca secret           |
+| `APCA_API_BASE_URL`   | Trading API host        |
+| `APCA_DATA_BASE_URL`  | Market data host        |
+| `APCA_DATA_FEED`      | Data feed (e.g., `iex`) |
+| `RUN_BACKTEST`        | `1` to backtest         |
+
+**Config Keys** (short descriptions only):
+
+| Key                   | Purpose           |
+| --------------------- | ----------------- |
+| `Symbols`             | Ticker list       |
+| `CashAtRisk`          | Deployable cash % |
+| `PerSymbolCap`        | Max per symbol %  |
+| `LookbackBars`        | Bars for SMA/BB   |
+| `StartDate`/`EndDate` | Backtest range    |
+| `InitialCash`         | Backtest cash     |
+| `RiskFreeAnnual`      | Annual r\_f       |
+| `CommissionPerShare`  | Per-share fee     |
+| `BacktestCSV`/`Plot`  | Outputs           |
+| `AllowShorts`         | Enable shorts     |
+| `CloseOnOpposite`     | Close then flip   |
+
+---
+
+## 📁 Output Files
+
+* **`backtest_equity.csv`** — date, equity, daily return
+* **`backtest_equity.png`** — equity curve (Sharpe in title)
+
+---
+
+## 📈 Plot Example
+
+![Equity Curve](backtest_equity.png)
+
+---
+
+## 🔍 Notes & Limitations
+
+* Use **paper trading** while validating behavior.
+* Free data typically requires `APCA_DATA_FEED=iex`.
+* Ensure you’re hitting the **data host** for bars (not the trading host).
+* Signals are **rule-based**; no ML libraries involved.
+* Backtest is **daily** and simplified; no intraday fills/slippage modeling.
+
+---
+
+## 📜 License
+
+MIT — use, modify, and distribute with attribution.
+
+```
 ```
 
-Symbols and parameters can come from `config.yml` or be edited in the bottom “Live path” block.
-
-### Backtest (chart + CSV + Sharpe)
-
-Runs the backtester, shows chart, writes files alongside the script:
-
-```bash
-RUN_BACKTEST=1 /usr/local/bin/python3 /Users/qikunye/Documents/GitHub/tradingbot/simplified_tradingbot.py
-```
-
-Outputs:
-
-* `backtest_equity.csv` (date, equity, ret)
-* `backtest_equity.png` (equity curve with Sharpe in title)
-* Console line with **Final Equity** and **Sharpe**
-
-
-## Signals
-
-* **SMA crossover** (20 fast / 50 slow):
-
-  * `buy`: fast crosses above slow.
-  * `sell`: fast crosses below slow.
-* **Bollinger breakout** (20, 1σ):
-
-  * `buy`: close > upper band.
-  * `sell`: close < lower band.
-* Priority: **SMA first, then BB** fallback.
-* No naked shorts by default (`AllowShorts: false`).
-
-### Make it more/less active
-
-* Shorten SMA windows: e.g., 10/20.
-* Change Bollinger `n_std` to 0.8–1.2.
-* Switch priority (BB first, then SMA) where signals are combined.
-
-## Sizing
-
-* Available cash × `CashAtRisk` = total deployable.
-* Split evenly across active signals.
-* Per symbol capped by `PerSymbolCap` × available cash.
-* Share quantity = floor(allocation\_cash / last\_price).
-
-## Backtesting details
-
-* Frequency: daily.
-* Data source order:
-
-  1. Local CSV `{SYMBOL}_ohlcv.csv` next to the script.
-  2. Alpaca Market Data v2 (IEX feed by default).
-
-### Portfolio
-
-* Tracks cash and integer share positions.
-* Optional short entries if `AllowShorts: true`.
-* Closes opposite side first if `CloseOnOpposite: true`.
-
-### Metrics
-
-* Equity curve saved to PNG and CSV.
-* Returns = daily pct change of equity.
-* Sharpe ratio (annualized):
-
-  ```
-  Sharpe = ((mean(returns) - risk_free) / stdev(returns)) * sqrt(252)
-  ```
-* `RiskFreeAnnual` is converted to daily via:
-
-  ```
-  (1 + r_f)^(1/252) - 1
-  ```
 
 
 
