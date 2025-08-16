@@ -1,225 +1,191 @@
-# ML Trading Bot
 
-A sophisticated algorithmic trading system that combines multiple machine learning models, sentiment analysis, and Thompson sampling for automated stock trading using the Alpaca API.
 
-## 🚀 Features
+## Multi-symbol Alpaca trading bot with **SMA (20/50)** + **Bollinger Bands (20, 1σ)** signals.  
+Two modes:
 
-- **Multi-Model ML Approach**: Combines Transformer models and XGBoost for price prediction
-- **Sentiment Analysis**: Uses FinBERT and NewsAPI for market sentiment evaluation
-- **Thompson Sampling**: Multi-armed bandit approach for asset selection optimization
-- **Risk Management**: Dynamic position sizing with stop-loss and take-profit orders
-- **Backtesting Support**: Historical strategy validation using Yahoo Finance data
-- **Real-time Trading**: Live trading capabilities through Alpaca API
 
-## 🛠 Tech Stack
+- **Live** trading against Alpaca (paper by default).
+- **Backtest** with an equity curve PNG + CSV and **Sharpe ratio**.
 
-- **Python 3.8+**
-- **Trading Framework**: Lumibot
-- **ML Models**: 
-  - Hugging Face Transformers (TimeSeriesTransformerForPrediction)
-  - XGBoost
-  - FinBERT for sentiment analysis
-- **Data Sources**: 
-  - Alpaca API (live trading)
-  - Yahoo Finance (backtesting)
-  - NewsAPI (sentiment data)
-- **Key Libraries**: pandas, numpy, torch, scikit-learn, yfinance
+## Features
+- Trades multiple symbols (e.g., `SPY`, `AAPL`, `MSFT`).
+- Signals: SMA crossover first, then Bollinger breakout as fallback.
+- Simple, transparent risk sizing:
+  - Deploys `CashAtRisk` fraction of available cash per run.
+  - Splits evenly across all active signals.
+  - Caps per-symbol allocation via `PerSymbolCap`.
+- Live orders via Alpaca REST.
+- Backtesting (daily):
+  - Loads local CSVs if present, otherwise pulls Alpaca Market Data (IEX).
+  - Tracks cash, positions, equity, returns.
+  - Outputs `backtest_equity.csv`, `backtest_equity.png`, and Sharpe ratio.
+- Configurable via env vars and/or `config.yml`.
 
-## 📋 Prerequisites
+## Requirements
+- Python 3.10+ (tested with `/usr/local/bin/python3` on macOS).
+- Packages:
+  ```bash
+  pip install requests pandas pyyaml matplotlib
+````
 
-### API Keys Required
+## Files
 
-1. **Alpaca Trading Account**
-   - Get API keys from [Alpaca Markets](https://alpaca.markets/)
-   - Paper trading supported for testing
+* `simplified_tradingbot.py` — the bot, signals, backtester, and entrypoints.
+* `config.yml` — optional config (API keys, symbols, risk, backtest dates).
+* Optional CSVs for backtests: `{SYMBOL}_ohlcv.csv` (e.g., `AAPL_ohlcv.csv`).
 
-2. **NewsAPI Key** 
-   - Sign up at [NewsAPI](https://newsapi.org/)
-   - Free tier available
+> The CSV loader supports:
+>
+> * Standard Yahoo-style headers.
+> * Two-row header format:
+>
+>   * Row 0: `Price,Close,High,Low,Open,Volume`
+>   * Row 1: first column has `Date`, others `Ticker,...`
+>   * Data from row 2.
 
-### Required Files
+## Credentials & Endpoints
 
-Ensure these model files are in your project directory:
-- `transformer_price_model/` - Pre-trained Transformer model directory
-- `transformer_scaler.pkl` - Feature scaler for the Transformer model
-- `xgb_bollinger_model.json` - Trained XGBoost model
-- `xgb_features.pkl` - Feature names for XGBoost model
-- `config.yml` - Configuration file with API credentials
+Set environment variables (recommended):
 
-## ⚙️ Installation
-
-1. **Clone the repository**
 ```bash
-git clone <your-repo-url>
-cd ml-trading-bot
+export APCA_API_KEY_ID="YOUR_KEY_ID"
+export APCA_API_SECRET_KEY="YOUR_SECRET"
+# paper trading host (default)
+export APCA_API_BASE_URL="https://paper-api.alpaca.markets/v2"
+# market data host (separate from trading)
+export APCA_DATA_BASE_URL="https://data.alpaca.markets/v2"
+# free tier usually needs IEX feed
+export APCA_DATA_FEED="iex"
 ```
 
-2. **Install dependencies**
-```bash
-pip install lumibot alpaca-trade-api transformers torch xgboost pandas numpy yfinance requests joblib pyyaml
-```
+Or fill `config.yml`:
 
-3. **Set up configuration file**
-Create `config.yml`:
 ```yaml
 alpaca:
-  API_KEY: "your_alpaca_api_key"
-  API_SECRET: "your_alpaca_secret_key"
-  BASE_URL: "https://paper-api.alpaca.markets/v2"  # Use paper trading URL
-
-newsapi:
-  API_KEY: "your_newsapi_key"
+  API_KEY: "YOUR_KEY_ID"
+  API_SECRET: "YOUR_SECRET"
+  BASE_URL: "https://paper-api.alpaca.markets/v2"
+  DATA_BASE_URL: "https://data.alpaca.markets/v2"
 ```
 
-4. **Add your NewsAPI key**
-In `tradingbot.py`, replace:
-```python
-NEWSAPI_KEY = NEWS_API_KEY  # Replace with your actual key
+> The code prefers env vars. If missing, it falls back to `config.yml`.
+
+## Configuration (`config.yml`)
+
+Minimal example:
+
+```yaml
+alpaca:
+  API_KEY: ""     
+  API_SECRET: ""
+  BASE_URL: "https://paper-api.alpaca.markets/v2"
+  DATA_BASE_URL: "https://data.alpaca.markets/v2"
+
+Symbols:
+  - SPY
+  - AAPL
+  - MSFT
+
+# Live/backtest shared
+CashAtRisk: 0.10          # fraction of available cash per run
+PerSymbolCap: 0.50        # cap per symbol as fraction of available cash
+LookbackBars: 200
+
+# Backtest options
+StartDate: "2024-01-01"
+EndDate: null             # to “today”
+InitialCash: 100000
+RiskFreeAnnual: 0.00
+CommissionPerShare: 0.00
+BacktestCSV: "backtest_equity.csv"
+Plot: true
+
+# Execution preferences
+AllowShorts: false
+CloseOnOpposite: true
 ```
 
-## 🎯 Usage
+## Running
 
-### Backtesting Mode
-```python
-# Configure symbols and date range
-symbols = [Asset("SPY"), Asset("AAPL")]
-start_date = pd.Timestamp("2019-10-01").tz_localize(None)
-end_date = pd.Timestamp("2024-12-31").tz_localize(None)
+### Live trading (paper by default)
 
-# Run backtest
-strategy.backtest(YahooDataBacktesting, start_date, end_date)
+Places orders, prints signals, **no chart**:
+
+```bash
+/usr/local/bin/python3 /Users/qikunye/Documents/GitHub/tradingbot/simplified_tradingbot.py
 ```
 
-### Live Trading Mode
-```python
-# Uncomment these lines in the code:
-trader = Trader()
-trader.add_strategy(strategy)
-trader.run_all()
+Symbols and parameters can come from `config.yml` or be edited in the bottom “Live path” block.
+
+### Backtest (chart + CSV + Sharpe)
+
+Runs the backtester, shows chart, writes files alongside the script:
+
+```bash
+RUN_BACKTEST=1 /usr/local/bin/python3 /Users/qikunye/Documents/GitHub/tradingbot/simplified_tradingbot.py
 ```
 
-### Key Parameters
-- `symbols`: List of assets to trade (default: ["SPY", "AAPL"])
-- `cash_at_risk`: Portion of available cash to risk per trade (default: 0.5)
-- `sleeptime`: Time between trading iterations (default: "24H")
+Outputs:
 
-## 🧠 How It Works
+* `backtest_equity.csv` (date, equity, ret)
+* `backtest_equity.png` (equity curve with Sharpe in title)
+* Console line with **Final Equity** and **Sharpe**
 
-### 1. Asset Selection (Thompson Sampling)
-Uses multi-armed bandit approach to optimize asset selection based on historical win/loss ratios.
 
-### 2. Price Prediction
-- **Transformer Model**: Predicts next-day closing price using OHLCV data and time features
-- **XGBoost Model**: Predicts returns using Bollinger Bands and technical indicators
+## Signals
 
-### 3. Sentiment Analysis
-- Fetches recent news headlines for each symbol via NewsAPI
-- Uses FinBERT model to classify sentiment (positive/negative/neutral)
-- Adjusts trading signals based on sentiment probability
+* **SMA crossover** (20 fast / 50 slow):
 
-### 4. Signal Generation
-Combines predictions with weighted scoring:
-```python
-combined_score = transformer_weight * price_change_ratio + xgb_weight * predicted_return
-adjusted_score = combined_score * (1 + 0.1 * sentiment_factor)
-```
+  * `buy`: fast crosses above slow.
+  * `sell`: fast crosses below slow.
+* **Bollinger breakout** (20, 1σ):
 
-### 5. Risk Management
-- Dynamic position sizing based on available cash
-- Volatility-adjusted stop-loss and take-profit levels
-- Maximum drawdown protection (30% limit)
-- Trade cooldown periods (5 days between trades per symbol)
+  * `buy`: close > upper band.
+  * `sell`: close < lower band.
+* Priority: **SMA first, then BB** fallback.
+* No naked shorts by default (`AllowShorts: false`).
 
-## 📊 Model Details
+### Make it more/less active
 
-### Transformer Model
-- **Purpose**: Price prediction using time series data
-- **Input Features**: OHLCV + day_of_week, day_of_month, month
-- **Architecture**: TimeSeriesTransformerForPrediction from Hugging Face
-- **Context Length**: Configurable based on model config
+* Shorten SMA windows: e.g., 10/20.
+* Change Bollinger `n_std` to 0.8–1.2.
+* Switch priority (BB first, then SMA) where signals are combined.
 
-### XGBoost Model  
-- **Purpose**: Return prediction using technical indicators
-- **Features**: Bollinger Bands, volume ratios, price returns
-- **Output**: Expected return percentage
+## Sizing
 
-### FinBERT Sentiment
-- **Purpose**: News sentiment classification
-- **Input**: Recent news headlines (3-day window)
-- **Output**: Sentiment probability and classification
+* Available cash × `CashAtRisk` = total deployable.
+* Split evenly across active signals.
+* Per symbol capped by `PerSymbolCap` × available cash.
+* Share quantity = floor(allocation\_cash / last\_price).
 
-## ⚠️ Risk Disclaimers
+## Backtesting details
 
-- **This is experimental software**: Use paper trading first
-- **Past performance ≠ Future results**: Models may not work in all market conditions
-- **Market Risk**: You can lose money trading stocks
-- **Model Risk**: ML predictions can be wrong
-- **API Risk**: Ensure stable internet and API connections
+* Frequency: daily.
+* Data source order:
 
-## 🔧 Configuration Options
+  1. Local CSV `{SYMBOL}_ohlcv.csv` next to the script.
+  2. Alpaca Market Data v2 (IEX feed by default).
 
-### Strategy Parameters
-```python
-MLTrader(
-    symbols=["SPY", "AAPL", "QQQ"],  # Assets to trade
-    cash_at_risk=0.3,                # Risk 30% of cash per trade
-)
-```
+### Portfolio
 
-### Model Thresholds
-- **Volatility Factor**: 1.5 (high confidence) or 2.5 (normal)
-- **Score Threshold**: Dynamic based on market volatility
-- **Sentiment Threshold**: 0.55 (positive), 0.45 (negative)
+* Tracks cash and integer share positions.
+* Optional short entries if `AllowShorts: true`.
+* Closes opposite side first if `CloseOnOpposite: true`.
 
-## 📈 Performance Monitoring
+### Metrics
 
-The bot logs:
-- Portfolio value changes
-- Individual trade decisions and reasoning
-- Model predictions vs actual outcomes
-- Sentiment analysis results
-- Risk management actions
+* Equity curve saved to PNG and CSV.
+* Returns = daily pct change of equity.
+* Sharpe ratio (annualized):
 
-## 🐛 Troubleshooting
+  ```
+  Sharpe = ((mean(returns) - risk_free) / stdev(returns)) * sqrt(252)
+  ```
+* `RiskFreeAnnual` is converted to daily via:
 
-### Common Issues
+  ```
+  (1 + r_f)^(1/252) - 1
+  ```
 
-1. **"Insufficient data" errors**
-   - Ensure symbols have enough historical data
-   - Check internet connection for data fetching
 
-2. **Model loading failures**
-   - Verify all model files are in the correct directories
-   - Check file permissions
-
-3. **API connection errors**
-   - Validate API keys in config.yml
-   - Check API rate limits
-
-4. **Sentiment analysis failures**
-   - Verify NewsAPI key and quota
-   - Check if headlines contain relevant keywords
-
-## 📝 License
-
-This project is for educational purposes. Use at your own risk for live trading.
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable  
-5. Submit a pull request
-
-## 📞 Support
-
-For issues and questions:
-- Check the troubleshooting section
-- Review Lumibot documentation
-- Verify API credentials and permissions
-
----
-
-**⚠️ Important**: Always test with paper trading before using real money. This bot is experimental and may not be profitable in all market conditions.
 
